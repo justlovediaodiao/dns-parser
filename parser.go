@@ -1,5 +1,9 @@
 package dnsparser
 
+import (
+	"fmt"
+)
+
 type Flag struct {
 	QueryResponseFlag       byte
 	OperationCode           byte
@@ -113,38 +117,113 @@ func (q Question) ClassString() string {
 	}
 }
 
+type ResourceRecord struct {
+	Question
+	TTL                uint32
+	ResourceDataLength uint16
+	ResourceData       []byte
+}
+
+func (r ResourceRecord) ResourceDataString() string {
+	switch r.Type {
+	case 1:
+		return fmt.Sprintf("%d.%d.%d.%d", r.ResourceData[0], r.ResourceData[1], r.ResourceData[2], r.ResourceData[3])
+	case 2, 5:
+		name, _ := parseDNSName(r.ResourceData)
+		return name
+	default: // todo
+		return "NOT SUPPORTED"
+	}
+}
+
 type DNSMessage struct {
-	Header    Header
-	Questions []Question
+	Header            Header
+	Questions         []Question
+	AnswerRecords     []ResourceRecord
+	AuthorityRecords  []ResourceRecord
+	AdditionalRecords []ResourceRecord
 }
 
 func (m *DNSMessage) String() string {
-	if m.Header.Flag.QueryResponseFlag != 0 {
-		return "DNS Response message currently not supported"
-	}
-	var r string
+	var result string
 	op := m.Header.Flag.OperationCodeString()
 	for _, q := range m.Questions {
 		line := op + ":\t" + q.Name + "\t" + q.TypeString() + "\t" + q.ClassString()
-		if r == "" {
-			r = line
+		if result == "" {
+			result = line
 		} else {
-			r += "\n" + line
+			result += "\n" + line
 		}
 	}
-	return r
+	if m.Header.Flag.QueryResponseFlag == 0 {
+		return result
+	}
+
+	if m.Header.Flag.ResponseCode != 0 {
+		result += "\nANSWER:\t" + m.Header.Flag.ResponseCodeString()
+		return result
+	}
+
+	for _, r := range m.AnswerRecords {
+		line := "ANSWER:\t" + r.Name + "\t" + r.ResourceDataString() + "\t" + r.TypeString() + "\t" + r.ClassString()
+		if result == "" {
+			result = line
+		} else {
+			result += "\n" + line
+		}
+	}
+	for _, r := range m.AuthorityRecords {
+		line := "AUTHORITY:\t" + r.Name + "\t" + r.ResourceDataString() + "\t" + r.TypeString() + "\t" + r.ClassString()
+		if result == "" {
+			result = line
+		} else {
+			result += "\n" + line
+		}
+	}
+	for _, r := range m.AdditionalRecords {
+		line := "ADDITIONAL:\t" + r.Name + "\t" + r.ResourceDataString() + "\t" + r.TypeString() + "\t" + r.ClassString()
+		if result == "" {
+			result = line
+		} else {
+			result += "\n" + line
+		}
+	}
+	return result
+}
+
+type parser struct {
+	packet []byte
+	pos    int
 }
 
 func Parse(packet []byte) *DNSMessage {
 	var msg DNSMessage
-	header, n := parseHeader(packet)
+	p := parser{packet, 0}
+	header := p.parseHeader()
 	msg.Header = header
-	msg.Questions = make([]Question, int(header.QuestionCount))
-	for i := 0; i < int(header.QuestionCount); i++ {
-		packet = packet[n:]
-		var question Question
-		question, n = parseQuestion(packet)
-		msg.Questions[i] = question
+	if header.QuestionCount > 0 {
+		msg.Questions = make([]Question, int(header.QuestionCount))
+		for i := 0; i < int(header.QuestionCount); i++ {
+			msg.Questions[i] = p.parseQuestion()
+		}
+	}
+	if header.AnswerRecordCount > 0 {
+		msg.AnswerRecords = make([]ResourceRecord, int(header.AnswerRecordCount))
+		for i := 0; i < int(header.AnswerRecordCount); i++ {
+			msg.AnswerRecords[i] = p.parseResourceRecord()
+		}
+	}
+	if header.AuthorityRecordCount > 0 {
+		msg.AuthorityRecords = make([]ResourceRecord, int(header.AuthorityRecordCount))
+		for i := 0; i < int(header.AuthorityRecordCount); i++ {
+			msg.AuthorityRecords[i] = p.parseResourceRecord()
+		}
+	}
+	if header.AdditionalRecordCount > 0 {
+		msg.AdditionalRecords = make([]ResourceRecord, int(header.AdditionalRecordCount))
+		for i := 0; i < int(header.AdditionalRecordCount); i++ {
+			msg.AdditionalRecords[i] = p.parseResourceRecord()
+		}
 	}
 	return &msg
 }
@@ -153,19 +232,25 @@ func bytesToU16(b []byte) uint16 {
 	return uint16(b[0])<<8 | uint16(b[1])
 }
 
+func bytesToU32(b []byte) uint32 {
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
 func bitTobyte(b byte, s, e int) byte {
 	return (b >> (8 - e)) & (1<<(e-s) - 1)
 }
 
-func parseHeader(b []byte) (Header, int) {
+func (p *parser) parseHeader() Header {
 	var header Header
+	b := p.packet
 	header.Identifer = bytesToU16(b[:2])
 	header.Flag = parseFlag(b[2:4])
 	header.QuestionCount = bytesToU16(b[4:6])
 	header.AnswerRecordCount = bytesToU16(b[6:8])
 	header.AuthorityRecordCount = bytesToU16(b[8:10])
 	header.AdditionalRecordCount = bytesToU16(b[10:12])
-	return header, 12
+	p.pos = 12
+	return header
 }
 
 func parseFlag(b []byte) Flag {
@@ -180,9 +265,31 @@ func parseFlag(b []byte) Flag {
 	return flag
 }
 
-func parseQuestion(b []byte) (Question, int) {
-	var i int
+func (p *parser) parseQuestion() Question {
 	var question Question
+	question.Name = p.parseDNSName()
+	b := p.packet[p.pos:]
+	question.Type = bytesToU16(b[:2])
+	question.Class = bytesToU16(b[2:4])
+	p.pos += 4
+	return question
+}
+
+func (p *parser) parseDNSName() string {
+	b := p.packet[p.pos:]
+	if b[0] >= 192 {
+		name, _ := parseDNSName(p.packet[int(b[1]):])
+		p.pos += 2
+		return name
+	}
+	name, n := parseDNSName(b)
+	p.pos += n
+	return name
+}
+
+func parseDNSName(b []byte) (string, int) {
+	var name string
+	var i int
 	for {
 		length := b[i]
 		i++
@@ -190,13 +297,23 @@ func parseQuestion(b []byte) (Question, int) {
 			break
 		}
 		end := i + int(length)
-		if question.Name != "" {
-			question.Name += "."
+		if name != "" {
+			name += "."
 		}
-		question.Name += string(b[i:end])
+		name += string(b[i:end])
 		i = end
 	}
-	question.Type = bytesToU16(b[i : i+2])
-	question.Class = bytesToU16(b[i+2 : i+4])
-	return question, i + 4
+	return name, i
+}
+
+func (p *parser) parseResourceRecord() ResourceRecord {
+	var record ResourceRecord
+	record.Question = p.parseQuestion()
+	b := p.packet[p.pos:]
+	record.TTL = bytesToU32(b[:4])
+	length := bytesToU16(b[4:6])
+	record.ResourceDataLength = length
+	record.ResourceData = b[6 : 6+length]
+	p.pos += 6 + int(length)
+	return record
 }
